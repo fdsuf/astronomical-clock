@@ -1,8 +1,32 @@
 # 桌面天文机械表
 
+纯 PyQt6 自绘的高仿真机械表盘，无任何外部图片素材。六套主题、严格啮合齿轮系、陀飞轮，日月位置与节气月相均按真实天文算法实时计算。
+
+## 下载即用
+
+不想装 Python 的话，直接到 [Releases](https://github.com/fdsuf/astronomical-clock/releases)
+下载 `AstronomicalClock-v1.0.0-win64.exe`，双击运行。
+
+## 从源码运行
+
+```bash
+pip install PyQt6
+```
+
+然后双击 `桌面天文机械表.pyw`（`.pyw` 不走控制台，不会闪黑窗口）。
+
+自己打包 exe：
+
+```bash
+python tools/make_icon.py
+python -m PyInstaller build.spec --noconfirm --clean
+```
+
+产物在 `dist\桌面天文机械表.exe`。
+
 ## 怎么用
 
-**直接双击 `dist\桌面天文机械表.exe`** —— 单文件，无需安装 Python，不会闪 cmd 窗口。
+**双击 exe** 即可 —— 单文件，无需安装 Python，不会闪 cmd 窗口。
 
 其他入口：
 
