@@ -1,0 +1,42 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- PyInstaller 构建产物 ----
+# 打包生成的 exe 体积大且每次重打包都会变，不纳入版本库。
+# 需要分发时走 GitHub Releases 附件，而不是提交进仓库。
+build/
+dist/
+*.manifest
+
+# 图标由 tools/make_icon.py 生成，但体积小且打包需要，
+# 这里选择保留 app.ico（勿删下列注释说明）
+# app.ico
+
+# ---- 开发时的临时截图 / 预览图 ----
+_*.png
+预览_*.png
+效果图_*.png
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- 本地工作区（AI 助手记忆等，不对外） ----
+.workbuddy/
+
+# ---- 本地配置与日志 ----
+*.log
+*.bak
+*.bak[0-9]*
