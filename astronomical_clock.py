@@ -3,23 +3,33 @@
 桌面天文机械表 - 挂机版
 Python + PyQt6 单文件实现
 天文算法：Meeus 简化算法（太阳视黄经 / 月相 / 恒星时 / 二十四节气）
-六种样式：经典天文钟 / 赛博朋克霓虹 / 极简现代 / 中式古风 / 高仿真机械表 / 天文机械腕表
+六种内置样式：经典天文钟 / 赛博朋克霓虹 / 极简现代 / 中式古风 / 高仿真机械表 / 天文机械腕表
+另支持自定义背景图片表盘
 """
 import sys
 import os
 import math
 import json
 import random
+import shutil
 import urllib.request
 from datetime import datetime, timezone
 
-from PyQt6.QtCore import Qt, QTimer, QPoint, QPointF, QLineF, QSettings, QThread, pyqtSignal, QRectF
+try:
+    import winreg  # 仅 Windows 可用；用于开机自启动注册表项
+except ImportError:  # 非 Windows 平台：功能降级为「不支持」
+    winreg = None
+
+from PyQt6.QtCore import (
+    Qt, QTimer, QPoint, QPointF, QLineF, QSettings, QThread, pyqtSignal, QRect, QRectF,
+)
 from PyQt6.QtGui import (
-    QPainter, QColor, QPen, QBrush, QFont, QPolygonF, QPainterPath, QIcon,
-    QFontMetrics, QFontMetricsF, QPixmap, QConicalGradient, QLinearGradient, QRadialGradient,
+    QRegion, QPainter, QColor, QPen, QBrush, QFont, QPolygonF, QPainterPath, QIcon,
+    QFontMetrics, QFontMetricsF, QPixmap, QConicalGradient, QLinearGradient, QRadialGradient, QCursor,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QMenu, QInputDialog, QMessageBox, QSystemTrayIcon,
+    QApplication, QWidget, QMenu, QInputDialog, QMessageBox, QSystemTrayIcon, QFileDialog,
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
 )
 
 # ---------------- 配色 ----------------
@@ -88,7 +98,7 @@ ASTRO_GOLD    = QColor(224, 190, 112)       # 金色天文指示
 ASTRO_MOON    = QColor(247, 235, 205)       # 月面
 ASTRO_TEXT    = QColor(232, 224, 206)       # 米白文字
 
-THEMES = ["classic", "cyber", "minimal", "chinese", "mechanical", "astro"]
+THEMES = ["classic", "cyber", "minimal", "chinese", "mechanical", "astro", "custom"]
 THEME_NAMES = {
     "classic": "经典天文钟",
     "cyber": "赛博朋克霓虹",
@@ -96,8 +106,18 @@ THEME_NAMES = {
     "chinese": "中式古风",
     "mechanical": "高仿真机械表",
     "astro": "天文机械腕表",
+    "custom": "自定义背景图片",
 }
-SIZES = [280, 340, 400, 500, 600]
+SIZES = [280, 340, 400, 500, 600]   # 右键菜单里的快捷档位（非限制）
+MIN_SIZE = 100                       # 自由缩放下限
+MAX_SIZE = 900                       # 自由缩放上限
+WHEEL_STEP = 20                      # Ctrl + 滚轮每格调整的像素
+DOCK_SIZE = 96                       # 贴屏幕边缘后缩成的小表尺寸
+DOCK_SNAP = 16                       # 松手时判定贴边、进入吸附的距离(px)
+DOCK_ANIM_MS = 260                   # 吸附放大/缩小的过渡动画时长(ms)
+DOCK_ANIM_TICK = 16                  # 过渡动画帧间隔(ms)，约 60fps
+DRAW_INTERVAL_MS = 50                # 主绘制定时器间隔(ms)，约 20fps；秒针扫动仍顺滑，占用比 30fps 低约 1/3
+HOVER_INTERVAL_MS = 120              # 吸附悬停轮询间隔(ms)
 BASE = 400.0  # 逻辑绘制基准边长
 
 # 托盘图标配色（按主题取一对「盘面底色 / 指针·边框色」，保证 16px 下仍可辨认）
@@ -108,8 +128,53 @@ TRAY_PALETTE = {
     "chinese":    (QColor(245, 238, 220), QColor(185, 58, 43)),
     "mechanical": (QColor(26, 28, 32), QColor(214, 158, 96)),
     "astro":      (QColor(10, 24, 48), QColor(216, 178, 118)),
+    "custom":     (QColor(38, 42, 50), QColor(245, 228, 196)),
 }
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 自定义背景：复制到用户目录，避免原图移动/删除后失效
+_BG_EXTENSIONS = ".png *.jpg *.jpeg *.webp *.bmp"
+
+
+def _background_dir():
+    """返回用于保存背景图片副本的目录。"""
+    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(appdata, "AstroClock", "backgrounds")
+
+
+def _cleanup_background_copies(keep_path=None):
+    """清理 backgrounds 目录里未被当前设置引用的图片副本。
+
+    只处理本程序按 bg_ 命名规则生成的图片文件，目录里其他文件一律不动；
+    删除失败（被占用/无权限）时静默跳过，不影响主流程。返回删除数量。
+    """
+    bg_dir = _background_dir()
+    if not os.path.isdir(bg_dir):
+        return 0
+    # _BG_EXTENSIONS 是给文件对话框用的，形如 "*.png *.jpg"；
+    # endswith 判断要去掉通配符，只留 ".png" 这样的扩展名。
+    exts = tuple(ext.lstrip("*") for ext in _BG_EXTENSIONS.split())
+    keep = os.path.normcase(os.path.abspath(keep_path)) if keep_path else ""
+    removed = 0
+    try:
+        names = os.listdir(bg_dir)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.startswith("bg_") or not name.lower().endswith(exts):
+            continue
+        full = os.path.join(bg_dir, name)
+        if not os.path.isfile(full):
+            continue
+        if keep and os.path.normcase(os.path.abspath(full)) == keep:
+            continue
+        try:
+            os.remove(full)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
 
 # ===== 齿轮系：统一模数 + 节圆相切 + 齿数比联动 + 相位咬合 =====
 GEAR_MODULE = 1.25                      # 模数 m：所有齿轮齿高一致，是啮合的前提
@@ -290,6 +355,303 @@ class Locator(QThread):
         self.located.emit(lat, lon)
 
 
+# ---------------- 开机自启动（Windows 注册表 Run 项） ----------------
+# 启动项名称与注册表位置。HKCU 无需管理员权限。
+_AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_AUTOSTART_NAME = "AstroClock"
+# 任务管理器「启动」标签的禁用开关写在这里；Run 项仍在但程序不会启动，
+# 因此判断真实状态时必须一并检查它，否则菜单会误显示为「已启用」。
+_STARTUP_APPROVED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+
+
+def _autostart_command():
+    """拼出写入 Run 项的命令行。路径含空格/中文时整体加双引号，避免被截断。"""
+    if getattr(sys, "frozen", False):
+        # PyInstaller 单文件：sys.executable 就是 exe 本体
+        exe = os.path.abspath(sys.executable)
+        return '"%s"' % exe
+    # 源码运行：强制用 pythonw.exe 启动主脚本，避免开机时闪 cmd 黑窗
+    script = os.path.abspath(__file__)
+    py = sys.executable
+    if os.path.basename(py).lower() == "python.exe":
+        py = os.path.join(os.path.dirname(py), "pythonw.exe")
+    if not os.path.isfile(py):
+        py = sys.executable  # 找不到 pythonw 时退回当前解释器
+    return '"%s" "%s"' % (py, script)
+
+
+def get_autostart_status():
+    """实际读取注册表，返回 (是否真正启用, 注册表中的命令行)。
+
+    不依赖 QSettings 里的布尔值：用户可能在任务管理器里手动禁用，
+    此时 Run 项还在但不会启动，必须读 StartupApproved 标记才能反映真实状态。
+    """
+    if winreg is None:
+        return False, ""
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_KEY, 0, winreg.KEY_READ)
+    except OSError:
+        return False, ""
+    try:
+        try:
+            cmd, _ = winreg.QueryValueEx(key, _AUTOSTART_NAME)
+        except OSError:
+            return False, ""
+    finally:
+        winreg.CloseKey(key)
+    # 任务管理器「禁用」会往 StartupApproved\Run 写标志：首字节最低位为 1 表示禁用
+    try:
+        ak = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_APPROVED_KEY, 0, winreg.KEY_READ)
+        try:
+            data, _ = winreg.QueryValueEx(ak, _AUTOSTART_NAME)
+            if data and (data[0] & 1):
+                return False, cmd
+        finally:
+            winreg.CloseKey(ak)
+    except OSError:
+        pass
+    return True, cmd
+
+
+def set_autostart(enable):
+    """启用/禁用开机自启动。返回 (是否成功, 错误信息)。"""
+    if winreg is None:
+        return False, "当前系统不支持注册表自启动"
+    try:
+        key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _AUTOSTART_KEY, 0, winreg.KEY_SET_VALUE)
+        try:
+            if enable:
+                winreg.SetValueEx(key, _AUTOSTART_NAME, 0, winreg.REG_SZ, _autostart_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, _AUTOSTART_NAME)
+                except OSError:
+                    pass
+        finally:
+            winreg.CloseKey(key)
+        # 清掉任务管理器可能写入的禁用标记，保证勾选后真正会启动、取消后不留僵尸项
+        try:
+            ak = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_APPROVED_KEY, 0, winreg.KEY_SET_VALUE)
+            try:
+                try:
+                    winreg.DeleteValue(ak, _AUTOSTART_NAME)
+                except OSError:
+                    pass
+            finally:
+                winreg.CloseKey(ak)
+        except OSError:
+            pass
+        return True, ""
+    except OSError as exc:
+        return False, str(exc)
+
+
+# ---------------- 背景区域选择对话框 ----------------
+# 选择框占图片短边的比例范围：既有上限（不能选满超出短边的整图），也有下限
+# （不能无限缩小到一个点）。滚轮每格按比例缩放框，而不是缩放图片本身。
+FOCUS_BOX_RATIO_MIN = 0.20
+FOCUS_BOX_RATIO_MAX = 1.0
+FOCUS_BOX_STEP = 1.15
+
+
+class FocusPicker(QDialog):
+    """在整图预览上用可拖动、可缩放的正方形选择框圈定表盘显示区域。
+
+    预览始终完整显示原图（contain，不缩放图片）；选择框是正方形，滚轮改变框的
+    边长（crop_ratio），拖动改变框的位置。框内区域就是最终 cover 到表盘上的画面，
+    做到所见即所得。
+    """
+    def __init__(self, pixmap, fx=0.5, fy=0.5, parent=None, crop_ratio=1.0):
+        super().__init__(parent)
+        self.setWindowTitle("选择背景区域")
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
+        self._src = pixmap
+        self.fx, self.fy = fx, fy
+        self.crop_ratio = max(FOCUS_BOX_RATIO_MIN, min(FOCUS_BOX_RATIO_MAX, crop_ratio))
+        self._base = QPixmap()          # contain 后的整图预览；图片本身不再缩放
+
+        self._view = _FocusView(self)
+        self._size_label = QLabel("选区 100%")
+
+        screen = QApplication.primaryScreen().availableGeometry()
+        max_w, max_h = min(760, screen.width() - 80), min(560, screen.height() - 180)
+        if not pixmap.isNull():
+            self._base = pixmap.scaled(max_w, max_h, Qt.AspectRatioMode.KeepAspectRatio,
+                                       Qt.TransformationMode.SmoothTransformation)
+            self._view.setPixmap(self._base)
+            self._view.setFixedSize(self._base.size())
+        self._update_label()
+
+        tip = QLabel("滚动鼠标放大 / 缩小选择框；拖动选择框移到要显示的区域。"
+                     "框内画面就是表盘最终显示的区域。")
+        tip.setWordWrap(True)
+        btn_ok = QPushButton("确定")
+        btn_cancel = QPushButton("取消")
+        btn_ok.clicked.connect(self.accept)
+        btn_cancel.clicked.connect(self.reject)
+        btns = QHBoxLayout()
+        btns.addWidget(self._size_label)
+        btns.addStretch(1)
+        btns.addWidget(btn_ok)
+        btns.addWidget(btn_cancel)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(tip)
+        lay.addWidget(self._view, 1, Qt.AlignmentFlag.AlignCenter)
+        lay.addLayout(btns)
+
+    def _update_label(self):
+        self._size_label.setText("选区 %d%%" % round(self.crop_ratio * 100))
+
+    def zoom_box(self, factor, anchor=None):
+        """按 factor 改变选择框边长，并保持 anchor 指向的原图位置不动。
+
+        比例被夹在 [MIN, MAX]，到边界后继续滚动不再变化，避免无限放大/缩小。
+        """
+        if self._base.isNull():
+            return
+        old = self.crop_ratio
+        new = max(FOCUS_BOX_RATIO_MIN, min(FOCUS_BOX_RATIO_MAX, old * factor))
+        if abs(new - old) < 1e-6:
+            return
+        g = self._view._box_geometry()
+        u = v = None
+        ru = rv = 0.5
+        if g:
+            bx, by, bw, bh, _, _ = g
+            if anchor is not None and bw > 0 and bh > 0:
+                ax, ay = anchor.x(), anchor.y()
+                ru = max(0.0, min(1.0, (ax - bx) / bw))
+                rv = max(0.0, min(1.0, (ay - by) / bh))
+            u, v = bx + ru * bw, by + rv * bh
+        self.crop_ratio = new
+        if u is not None:
+            _, _, nw, nh, max_bx, max_by = self._view._box_geometry()
+            nbx = max(0.0, min(max_bx, u - ru * nw))
+            nby = max(0.0, min(max_by, v - rv * nh))
+            self.fx = nbx / max_bx if max_bx > 0 else 0.5
+            self.fy = nby / max_by if max_by > 0 else 0.5
+        self._update_label()
+        self._view.update()
+
+    def set_focus(self, x, y):
+        """由视图拖动回调：更新框位置比例并请求重绘。"""
+        self.fx, self.fy = max(0.0, min(1.0, x)), max(0.0, min(1.0, y))
+        self._view.update()
+
+    def result_focus(self):
+        return self.fx, self.fy
+
+
+class _FocusView(QLabel):
+    """整图预览；正方形选择框内就是 cover 后保留的区域。"""
+    def __init__(self, picker):
+        super().__init__()
+        self._picker = picker
+        self._dragging = False
+        self._drag_dx = 0.0   # 抓取点相对方框左上角的偏移
+        self._drag_dy = 0.0
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def _box_geometry(self):
+        """返回 (bx, by, side, side, max_bx, max_by)，均为视图像素坐标。
+
+        框边长 = 图片短边 × crop_ratio；比例有上下限，所以框不会无限缩放，
+        也不会越出图片。fx/fy 是框左上角在可移动范围内的比例。
+        """
+        pm = self.pixmap()
+        if pm is None or pm.isNull() or self._picker._base.isNull():
+            return None
+        short = min(self._picker._base.width(), self._picker._base.height())
+        side = max(1.0, short * self._picker.crop_ratio)
+        max_bx = max(0.0, self.width() - side)
+        max_by = max(0.0, self.height() - side)
+        return (max_bx * self._picker.fx, max_by * self._picker.fy,
+                side, side, max_bx, max_by)
+
+    def mousePressEvent(self, event):
+        g = self._box_geometry()
+        if g is None or event.button() != Qt.MouseButton.LeftButton:
+            return
+        bx, by, side, _, _, _ = g
+        pos = event.position()
+        x, y = pos.x(), pos.y()
+        if bx <= x <= bx + side and by <= y <= by + side:
+            # 点在方框内：保持抓取点相对方框的位置，拖动时方框不会跳动
+            self._drag_dx, self._drag_dy = x - bx, y - by
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        else:
+            # 点在方框外：把方框中心移到点击处，随后按中心跟随鼠标
+            self._drag_dx, self._drag_dy = side / 2.0, side / 2.0
+            _, _, _, _, max_bx, max_by = g
+            fx = max(0.0, min(1.0, (x - side / 2.0) / max_bx)) if max_bx > 0 else 0.5
+            fy = max(0.0, min(1.0, (y - side / 2.0) / max_by)) if max_by > 0 else 0.5
+            self._picker.set_focus(fx, fy)
+        self._dragging = True
+
+    def mouseMoveEvent(self, event):
+        if not self._dragging:
+            return
+        # 鼠标在对话框外释放时可能收不到 release，用 buttons 兜底复位
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            self._dragging = False
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            return
+        g = self._box_geometry()
+        if g is None:
+            return
+        _, _, _, _, max_bx, max_by = g
+        pos = event.position()
+        bx = pos.x() - self._drag_dx
+        by = pos.y() - self._drag_dy
+        fx = max(0.0, min(1.0, bx / max_bx)) if max_bx > 0 else self._picker.fx
+        fy = max(0.0, min(1.0, by / max_by)) if max_by > 0 else self._picker.fy
+        self._picker.set_focus(fx, fy)
+
+    def mouseReleaseEvent(self, event):
+        self._dragging = False
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta == 0:
+            event.ignore()
+            return
+        factor = FOCUS_BOX_STEP if delta > 0 else 1.0 / FOCUS_BOX_STEP
+        self._picker.zoom_box(factor, event.position())
+        event.accept()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        g = self._box_geometry()
+        if g is None:
+            return
+        bx, by, side, _, _, _ = g
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # 方框外压暗，突出保留区域
+        shade = QColor(0, 0, 0, 120)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(shade))
+        if by > 0:
+            p.drawRect(QRectF(0, 0, self.width(), by))
+        if by + side < self.height():
+            p.drawRect(QRectF(0, by + side, self.width(), self.height() - by - side))
+        if bx > 0:
+            p.drawRect(QRectF(0, by, bx, side))
+        if bx + side < self.width():
+            p.drawRect(QRectF(bx + side, by, self.width() - bx - side, side))
+        # 方框描边（明暗双线保证任意底色可见）
+        rect = QRectF(bx, by, side, side)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(0, 0, 0, 180), 4))
+        p.drawRect(rect)
+        p.setPen(QPen(QColor(245, 228, 196), 2))
+        p.drawRect(rect)
+        p.end()
+
+
 # ---------------- 主窗口 ----------------
 class AstroClock(QWidget):
     def __init__(self):
@@ -297,17 +659,56 @@ class AstroClock(QWidget):
         self.settings = QSettings("AstroClock", "AstroClock")
         self.lat = float(self.settings.value("lat", 30.0))
         self.lon = float(self.settings.value("lon", 120.0))
-        self.topmost = bool(self.settings.value("topmost", True))
+        # QSettings 在 Windows 注册表里会把 False 写成字符串 "false"；
+        # 若直接 bool("false") 会得到 True，导致取消置顶后重启又变回置顶。
+        # 指定 type=bool 让 Qt 按布尔语义解析 "false"/"0"/False。
+        self.topmost = bool(self.settings.value("topmost", True, type=bool))
         self.theme = self.settings.value("theme", "classic")
         if self.theme not in THEMES:
             self.theme = "classic"
+
+        # 自定义背景图片：启动时加载用户目录里的副本；原图移动/删除不影响显示
+        self.bg_pixmap = None          # 已按 cover 方式裁成正方形并缩放缓存
+        self._bg_warning = None
+        # 裁剪焦点（0~1）：默认正中心，选图后由用户点选并持久化
+        self.bg_fx = self._read_focus("bg_focus_x")
+        self.bg_fy = self._read_focus("bg_focus_y")
+        # 选择框大小：占图片短边的比例，越大框越大（选区越大）
+        self.bg_crop_ratio = self._read_crop_ratio()
+        self._load_background_pixmap(show_warning=False)
+        # 启动时清掉历史遗留的未引用副本，只保留当前设置指向的那一张
+        _cleanup_background_copies(self.settings.value("bg_path", "", type=str))
+
         self.size_px = int(self.settings.value("size_px", 400))
-        if self.size_px not in SIZES:
-            self.size_px = 400
+        # 支持自由尺寸：只要在合理范围内就保留（含拖拽/Ctrl+滚轮调出的非档位尺寸）
+        self.size_px = max(MIN_SIZE, min(MAX_SIZE, self.size_px))
         self.drag_pos = QPoint()
         self.resizing = False
         self.resize_start = QPoint()
         self.resize_start_size = self.size_px
+        self._wheel_acc = 0  # Ctrl+滚轮角度累积器（触控板/高精度滚轮）
+        # 边缘吸附状态：贴到屏幕左/右/上边时缩成小表，悬停放大、拖离恢复
+        self.docked = False          # 是否处于吸附（小表）状态
+        self.dock_edge = None        # 'left' / 'right' / 'top'
+        self.dock_hover = False      # 当前是否因悬停而放大
+        self.dock_need_leave = False # 进入吸附后需先移开鼠标一次，才允许悬停放大
+        self.dragging = False        # 左键拖动中（用于区分拖动与悬停）
+        # drag_move 标记本次左键按下是「移动窗口」还是「右下角缩放」。
+        # 必须在 __init__ 初始化：右键/中键 release 也会进入 mouseReleaseEvent，
+        # 若此时还没按下过左键、该属性不存在，会抛 AttributeError 导致程序退出。
+        self.drag_move = False
+        self.dock_pos = QPoint()     # 吸附时记录的贴边位置
+        # 吸附缩放：窗口物理几何固定，只动画绘制边长 view_size；绝不逐帧 setGeometry。
+        self.view_size = float(self.size_px)  # 当前绘制边长；paintEvent 用它做视口缩放
+        self.dock_anim = None        # QTimer 实例
+        self.dock_animating = False  # 动画进行中标记
+        self._anim_timer = None
+        self._anim_from = 0          # 起始绘制边长
+        self._anim_to = 0            # 目标绘制边长
+        self._anim_elapsed = 0       # 已播放毫秒
+        self._anim_after = None      # 结束回调
+        self._anim_last_size = 0     # 上一帧绘制边长
+        self._menu_hold_until = 0.0  # 菜单关闭后的悬停判定宽限期（时间戳秒）
 
         self.setWindowTitle("桌面天文机械表")
         self._apply_flags()
@@ -323,7 +724,7 @@ class AstroClock(QWidget):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update)
-        self.timer.start(33)
+        self.timer.start(DRAW_INTERVAL_MS)
 
         self.font_cn = QFont("Microsoft YaHei", 9)
         self.font_num = QFont("Segoe UI", 9)
@@ -347,10 +748,11 @@ class AstroClock(QWidget):
         self.tourb_half = 0.0
 
         # 首次交互预热相关：把字体字形/静态贴图/右键菜单的一次性初始化提前到启动阶段
-        self._ctx = None         # 天文数据缓存（每秒算一次，不必每帧重算）
-        self._ctx_sec = -1
+        self._ctx = None         # 天文数据缓存（每分钟算一次，不必每帧/每秒重算）
+        self._ctx_min = -1
         self._menu = None        # 右键菜单对象缓存（避免每次重建）
         self._menu_acts = {}     # 菜单 action 引用，便于刷新勾选标记
+        self._menu_depth = 0     # 菜单打开嵌套计数（>0 表示正在操作菜单，暂停吸附悬停缩回）
 
         self.locator = Locator()
         self.locator.located.connect(self.on_located)
@@ -369,8 +771,214 @@ class AstroClock(QWidget):
         self.tray_timer.timeout.connect(self._refresh_tray)
         self.tray_timer.start(15000)
 
+        # 吸附态悬停判定：用鼠标全局坐标轮询，规避窗口尺寸变化引起的
+        # enter/leave 反复触发（放大时鼠标会被“甩出”新边界而误判离开 → 抖动）。
+        self.hover_timer = QTimer(self)
+        self.hover_timer.timeout.connect(self._check_dock_hover)
+        self.hover_timer.start(HOVER_INTERVAL_MS)
+
         # 启动后空闲预热：消化首次右键/拖动的一次性初始化开销
         QTimer.singleShot(300, self._warm_up)
+        if self._bg_warning:
+            QTimer.singleShot(500, self._show_background_warning)
+
+    # ---- 自定义背景图片 ----
+    def _read_focus(self, key):
+        """读取焦点比例，非法/越界值回退到 0.5。"""
+        try:
+            v = float(self.settings.value(key, 0.5))
+            return v if 0.0 <= v <= 1.0 else 0.5
+        except (TypeError, ValueError):
+            return 0.5
+
+    def _read_crop_ratio(self):
+        """读取选择框占短边的比例；兼容旧版 bg_zoom（比例 = 1/zoom）。
+
+        旧版本存的是「图片放大倍率」，交互改版后不再使用。检测到旧键时换算
+        一次并迁移到 bg_crop_ratio，然后删掉旧键，避免每次启动重复换算。
+        """
+        v = self.settings.value("bg_crop_ratio", None)
+        if v is None:
+            old = self.settings.value("bg_zoom", None)
+            if old is None:
+                return 1.0
+            try:
+                ratio = 1.0 / float(old) if float(old) > 0 else 1.0
+            except (TypeError, ValueError, ZeroDivisionError):
+                ratio = 1.0
+            ratio = max(FOCUS_BOX_RATIO_MIN, min(FOCUS_BOX_RATIO_MAX, ratio))
+            self.settings.setValue("bg_crop_ratio", ratio)
+            self.settings.remove("bg_zoom")
+            self.settings.sync()
+            return ratio
+        try:
+            r = float(v)
+        except (TypeError, ValueError):
+            return 1.0
+        return max(FOCUS_BOX_RATIO_MIN, min(FOCUS_BOX_RATIO_MAX, r))
+
+    @staticmethod
+    def _cover_pixmap(path, side=1024, fx=0.5, fy=0.5, crop_ratio=1.0):
+        """把选择框内的画面裁成正方形并缓存，避免每帧解码/缩放。
+
+        fx/fy 是框左上角在可移动范围内的比例（0~1），与预览框一致；
+        crop_ratio 是框边长占图片短边的比例，比例越小选区越小。
+        """
+        src = QPixmap(path)
+        if src.isNull():
+            return None
+        scaled = src.scaled(side, side,
+                            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                            Qt.TransformationMode.SmoothTransformation)
+        # 裁剪窗口边长：图片短边 × 选择框比例
+        ratio = max(FOCUS_BOX_RATIO_MIN, min(FOCUS_BOX_RATIO_MAX, crop_ratio))
+        crop = max(1, min(side, int(round(side * ratio))))
+        over_x = scaled.width() - crop
+        over_y = scaled.height() - crop
+        x = max(0, min(int(round(over_x * fx)), over_x))
+        y = max(0, min(int(round(over_y * fy)), over_y))
+        part = scaled.copy(x, y, crop, crop)
+        if crop != side:
+            part = part.scaled(side, side, Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+        return part
+
+    def _load_background_pixmap(self, show_warning=True):
+        """从设置里的副本路径加载背景；文件丢失时降级为经典表盘。"""
+        path = self.settings.value("bg_path", "", type=str)
+        if not path:
+            self.bg_pixmap = None
+            return False
+        pm = self._cover_pixmap(path, fx=self.bg_fx, fy=self.bg_fy,
+                                crop_ratio=self.bg_crop_ratio)
+        if pm is None:
+            self.bg_pixmap = None
+            self.settings.remove("bg_path")
+            self.settings.remove("bg_name")
+            if self.theme == "custom":
+                self.theme = "classic"
+                self._bg_warning = "自定义背景图片无法读取，已恢复经典表盘。"
+            return False
+        self.bg_pixmap = pm
+        return True
+
+    def _show_background_warning(self):
+        msg = getattr(self, "_bg_warning", None)
+        if not msg:
+            return
+        self._bg_warning = None
+        was = self._suspend_topmost()
+        try:
+            QMessageBox.warning(self, "自定义背景图片", msg)
+        finally:
+            self._restore_topmost(was)
+
+    def choose_background_image(self):
+        """选择本地图片 → 复制到 APPDATA → 切换为自定义背景表盘。"""
+        was = self._suspend_topmost()
+        try:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择表盘背景图片", "",
+                "图片文件 (%s);;所有文件 (*)" % _BG_EXTENSIONS)
+            if not path:
+                return False
+            # 先验证图片可解码，再复制，避免把坏文件写进用户目录
+            if QPixmap(path).isNull():
+                QMessageBox.warning(self, "自定义背景图片", "这张图片无法读取，请换一张 JPG / PNG / WebP / BMP 图片。")
+                return False
+            try:
+                bg_dir = _background_dir()
+                os.makedirs(bg_dir, exist_ok=True)
+                ext = os.path.splitext(path)[1].lower() or ".png"
+                name = "bg_%s_%d%s" % (datetime.now().strftime("%Y%m%d_%H%M%S"),
+                                       random.randint(100, 999), ext)
+                dest = os.path.join(bg_dir, name)
+                shutil.copy2(path, dest)
+            except OSError as exc:
+                QMessageBox.warning(self, "自定义背景图片", "复制图片失败：\n%s" % exc)
+                return False
+            # 弹出区域选择器：用户拖动/缩放方框决定表盘显示哪一块
+            src_pm = QPixmap(dest)
+            picker = FocusPicker(src_pm, self.bg_fx, self.bg_fy, self, crop_ratio=1.0)
+            if picker.exec() != QDialog.DialogCode.Accepted:
+                # 取消：删掉刚复制的副本，不改动当前背景
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
+                return False
+            fx, fy = picker.result_focus()
+            ratio = picker.crop_ratio
+            pm = self._cover_pixmap(dest, fx=fx, fy=fy, crop_ratio=ratio)
+            if pm is None:
+                QMessageBox.warning(self, "自定义背景图片", "复制后的图片无法读取，请换一张图片。")
+                return False
+            self.bg_pixmap = pm
+            self.bg_fx, self.bg_fy, self.bg_crop_ratio = fx, fy, ratio
+            old_path = self.settings.value("bg_path", "", type=str)
+            self.settings.setValue("bg_path", dest)
+            self.settings.setValue("bg_name", os.path.basename(path))
+            self.settings.setValue("bg_focus_x", fx)
+            self.settings.setValue("bg_focus_y", fy)
+            self.settings.setValue("bg_crop_ratio", ratio)
+            self.settings.remove("bg_zoom")
+            self.settings.sync()
+            # 新副本已生效，删掉上一张不再被引用的副本（保留其它无关文件）
+            if old_path and os.path.normcase(os.path.abspath(old_path)) != os.path.normcase(os.path.abspath(dest)):
+                _cleanup_background_copies(dest)
+            self.set_theme("custom")
+            return True
+        finally:
+            self._restore_topmost(was)
+
+    def adjust_background_focus(self):
+        """已有背景时重新拖动/缩放选择框，即时重绘并持久化。"""
+        path = self.settings.value("bg_path", "", type=str)
+        if not path or not os.path.isfile(path):
+            return
+        src_pm = QPixmap(path)
+        if src_pm.isNull():
+            return
+        was = self._suspend_topmost()
+        try:
+            picker = FocusPicker(src_pm, self.bg_fx, self.bg_fy, self,
+                                 crop_ratio=self.bg_crop_ratio)
+            if picker.exec() != QDialog.DialogCode.Accepted:
+                return
+            fx, fy = picker.result_focus()
+            ratio = picker.crop_ratio
+            pm = self._cover_pixmap(path, fx=fx, fy=fy, crop_ratio=ratio)
+            if pm is None:
+                return
+            self.bg_pixmap = pm
+            self.bg_fx, self.bg_fy, self.bg_crop_ratio = fx, fy, ratio
+            self.settings.setValue("bg_focus_x", fx)
+            self.settings.setValue("bg_focus_y", fy)
+            self.settings.setValue("bg_crop_ratio", ratio)
+            self.settings.remove("bg_zoom")
+            self.settings.sync()
+            self.update()
+        finally:
+            self._restore_topmost(was)
+
+    def clear_background_image(self):
+        """恢复默认背景：停止使用图片，清理副本，并切回默认表盘（高仿真机械表）。"""
+        self.bg_pixmap = None
+        self.settings.remove("bg_path")
+        self.settings.remove("bg_name")
+        self.settings.remove("bg_zoom")
+        self.settings.remove("bg_crop_ratio")
+        self.settings.sync()
+        _cleanup_background_copies()
+        if self.theme == "custom":
+            self.set_theme("mechanical")
+        else:
+            if getattr(self, "tray", None) is not None:
+                self.tray.setIcon(self._make_tray_icon())
+                self._update_tray_tip()
+            if self._menu is not None:
+                self._refresh_menu()
+            self.update()
 
     def _apply_flags(self):
         flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
@@ -479,16 +1087,234 @@ class AstroClock(QWidget):
         self.settings.setValue("lat", lat)
         self.settings.setValue("lon", lon)
 
+    # ---- 边缘吸附（贴左/右/上边缩成小表，悬停放大，拖离恢复） ----
+    def _screen_geom(self):
+        """窗口当前所在屏幕的可用区域（不含任务栏）。"""
+        screen = QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
+        return screen.availableGeometry()
+
+    def _edge_near(self, threshold):
+        """判断是否贴近屏幕左/右/上边，返回边名或 None。
+        吸附态用绘制视口矩形判定（用户看到并拖动的是小表），非吸附态用窗口矩形。"""
+        g = self._view_global_rect() if getattr(self, "docked", False) else self.frameGeometry()
+        a = self._screen_geom()
+        if g.left() - a.left() <= threshold:
+            return "left"
+        if a.right() - g.right() <= threshold:
+            return "right"
+        if g.top() - a.top() <= threshold:
+            return "top"
+        return None
+
+    def _view_origin(self, view):
+        """绘制内容在固定窗口矩形内的原点（窗口坐标）。
+        吸附态下表盘贴住对应屏幕边的那个角：left→左上角、right→右上角、top→上边居中；
+        这样无论放大缩小，贴边那一侧的位置永远由固定的窗口矩形决定，绝不漂移。"""
+        if not getattr(self, "docked", False):
+            return 0.0, 0.0
+        W = float(self.width())  # 固定窗口矩形边长（=dock_size，放大态尺寸）
+        edge = self.dock_edge or "right"
+        if edge in ("left", "right"):
+            x = 0.0 if edge == "left" else W - view
+            y = (W - view) / 2.0
+        else:  # top
+            x = (W - view) / 2.0
+            y = 0.0
+        return x, y
+
+    def _view_global_rect(self, view=None):
+        """当前绘制视口对应的屏幕全局矩形（鼠标命中判定用，与窗口几何无关）。"""
+        v = view if view is not None else getattr(self, "view_size", self.width())
+        vx, vy = self._view_origin(v)
+        g = self.frameGeometry()
+        return QRect(int(g.left() + vx), int(g.top() + vy), int(v), int(v))
+
+    def _dock_target_geom(self, size):
+        """计算吸附时固定的窗口矩形（放大态尺寸）：贴边摆放，另一轴居中。"""
+        a = self._screen_geom()
+        g = self.frameGeometry()
+        edge = self.dock_edge or "right"
+        if edge in ("left", "right"):
+            x = a.left() if edge == "left" else a.right() - size
+            y = max(a.top(), min(g.center().y() - size / 2, a.bottom() - size))
+        else:  # top
+            y = a.top()
+            x = max(a.left(), min(g.center().x() - size / 2, a.right() - size))
+        return QRect(int(x), int(y), int(size), int(size))
+
+    def _apply_mask(self, view=None):
+        """把窗口可见/命中区域裁成当前绘制视口。只在动画起止调用，中间不逐帧设。"""
+        if not getattr(self, "docked", False):
+            if not self.mask().isNull():
+                self.clearMask()
+            return
+        v = int(round(view if view is not None else getattr(self, "view_size", self.width())))
+        vx, vy = self._view_origin(v)
+        self.setMask(QRegion(int(vx), int(vy), v, v))
+
+    def _stop_dock_anim(self):
+        """中止进行中的吸附动画，把控制权交还拖动/手动操作。"""
+        timer = getattr(self, "_anim_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+            self._anim_timer = None
+        self.dock_anim = None
+        self.dock_animating = False
+
+    def _animate_view(self, to_size, after=None):
+        """只动画绘制边长 view_size，窗口物理几何全程不动 → 无重排抖动、无位置漂移。"""
+        self._stop_dock_anim()
+        self._anim_from = float(getattr(self, "view_size", self.width()))
+        self._anim_to = float(to_size)
+        self._anim_elapsed = 0
+        self._anim_after = after
+        self._anim_last_size = int(self._anim_from)
+        self.dock_animating = True
+        # 动画期间放开 mask（否则视口变大时内容被裁）；结束再按最终视口重设
+        if not self.mask().isNull():
+            self.clearMask()
+        timer = QTimer(self)
+        timer.setInterval(DOCK_ANIM_TICK)
+        timer.timeout.connect(self._anim_step)
+        self._anim_timer = timer
+        self.dock_anim = timer
+        timer.start()
+
+    def _anim_step(self):
+        """动画一帧：只更新绘制边长并重绘，绝不 setGeometry。"""
+        if not self.dock_animating:
+            return
+        self._anim_elapsed += DOCK_ANIM_TICK
+        t = min(1.0, self._anim_elapsed / float(DOCK_ANIM_MS))
+        ease = 1.0 - (1.0 - t) ** 3  # easeOutCubic
+        size = int(round(self._anim_from + (self._anim_to - self._anim_from) * ease))
+        if size != self._anim_last_size or t >= 1.0:
+            self.view_size = size
+            self._anim_last_size = size
+            self.update()
+        if t >= 1.0:
+            self.view_size = int(self._anim_to)
+            after = self._anim_after
+            self._stop_dock_anim()
+            self._apply_mask()  # 动画结束，按最终视口裁一次
+            if after:
+                after()
+
+    def _after_dock_shrink(self):
+        """缩小到小表结束：若鼠标仍压在小表视口上，先要求移开一次再允许放大。"""
+        if self.docked:
+            self.dock_need_leave = self._mouse_in_rect(self._view_global_rect())
+        else:
+            self.dock_need_leave = False
+
+    def _enter_dock(self, edge):
+        """进入吸附：把窗口几何一次性固定到放大态贴边矩形，之后只缩放绘制。"""
+        self.dock_size = self.width()
+        self.dock_edge = edge
+        self.docked = True
+        self.dock_hover = False
+        self.dock_need_leave = False
+        self.view_size = float(self.dock_size)
+        # 唯一一次几何变更：直接固定到放大态矩形，动画期间不再改动
+        self.setGeometry(self._dock_target_geom(self.dock_size))
+        self._animate_view(DOCK_SIZE, after=self._after_dock_shrink)
+
+    def _exit_dock(self):
+        """退出吸附：窗口几何保持固定，绘制视口放大回原尺寸（保持贴边对齐），
+        动画结束后一次性把窗口移到恢复几何。全程只改 view_size，不逐帧 setGeometry。"""
+        size = getattr(self, "dock_size", self.size_px)
+        # 记录恢复位置：以当前视口中心为中心摆放放大后的表盘
+        vr = self._view_global_rect()
+        a = self._screen_geom()
+        x = max(a.left(), min(int(vr.center().x() - size / 2), a.right() - size))
+        y = max(a.top(), min(int(vr.center().y() - size / 2), a.bottom() - size))
+        self._restore_geom = QRect(x, y, size, size)
+        # 保持 docked=True 直到动画结束，视口原点仍按吸附边对齐，画面连续不跳
+        self.dock_hover = False
+        self.dock_need_leave = False
+        self._animate_view(size, after=self._finish_exit)
+
+    def _finish_exit(self):
+        """退出动画结束：清 mask、切回正常态、一次性恢复自由几何。"""
+        self.docked = False
+        self.dock_edge = None
+        self.view_size = float(self.size_px)
+        if not self.mask().isNull():
+            self.clearMask()
+        restore = getattr(self, "_restore_geom", None)
+        if restore is not None:
+            self.setGeometry(restore)
+
+    def _save_pos(self):
+        """保存位置：吸附时按视口中心推算恢复原尺寸后的位置，避免下次启动半出屏。"""
+        pos = self.pos()
+        if self.docked:
+            size = getattr(self, "dock_size", self.size_px)
+            vr = self._view_global_rect()
+            a = self._screen_geom()
+            x = max(a.left(), min(int(vr.center().x() - size / 2), a.right() - size))
+            y = max(a.top(), min(int(vr.center().y() - size / 2), a.bottom() - size))
+            pos = QPoint(int(x), int(y))
+        self.settings.setValue("pos", pos)
+
+    def _mouse_in_rect(self, rect, margin=0):
+        """鼠标全局坐标是否落在矩形内（margin>0 时向外扩，做迟滞缓冲）。"""
+        p = QCursor.pos()
+        return (rect.left() - margin <= p.x() <= rect.right() + margin and
+                rect.top() - margin <= p.y() <= rect.bottom() + margin)
+
+    def _check_dock_hover(self):
+        """吸附态悬停判定（定时器轮询）。判定对象是「绘制视口全局矩形」，
+        与固定不变的窗口几何解耦；放大/缩回只改 view_size。"""
+        if not self.docked or self.dragging or self.dock_animating:
+            return
+        # 菜单打开期间不缩回；菜单关闭后给一段宽限期，避免鼠标移到菜单上/关闭瞬间误判离开
+        if self._menu_depth > 0 or self._menu_hold_until > 0:
+            if self._menu_depth > 0 or datetime.now().timestamp() < self._menu_hold_until:
+                return
+            self._menu_hold_until = 0.0
+        view = getattr(self, "view_size", DOCK_SIZE)
+        small_rect = self._view_global_rect()
+        if self.dock_need_leave:
+            if not self._mouse_in_rect(small_rect, margin=8):
+                self.dock_need_leave = False
+            return
+        if not self.dock_hover:
+            if self._mouse_in_rect(small_rect):
+                self.dock_hover = True
+                self._animate_view(getattr(self, "dock_size", self.size_px))
+        else:
+            # 放大态：以当前放大视口判定，离开再留出缓冲才缩回
+            big_rect = self._view_global_rect()
+            if not self._mouse_in_rect(big_rect, margin=24):
+                self.dock_hover = False
+                self._animate_view(DOCK_SIZE, after=self._after_dock_shrink)
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+
     # ---- 交互 ----
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            self._stop_dock_anim()  # 用户按下鼠标即接管，动画停在中间尺寸也不影响拖动
+            self.dragging = True
             pos = event.position().toPoint()
             handle = int(18 * self.width() / BASE)
-            if pos.x() >= self.width() - handle and pos.y() >= self.height() - handle:
+            # 吸附小表不提供右下角缩放（避免把 96 存成用户尺寸）
+            if (not self.docked and
+                    pos.x() >= self.width() - handle and pos.y() >= self.height() - handle):
                 self.resizing = True
+                self.drag_move = False
                 self.resize_start = event.globalPosition().toPoint()
                 self.resize_start_size = self.width()
             else:
+                self.drag_move = True
                 self.drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             event.accept()
 
@@ -496,29 +1322,78 @@ class AstroClock(QWidget):
         if event.buttons() & Qt.MouseButton.LeftButton:
             if self.resizing:
                 delta = event.globalPosition().toPoint() - self.resize_start
-                new_size = max(220, min(900, max(self.resize_start_size + delta.x(),
-                                                 self.resize_start_size + delta.y())))
+                new_size = max(MIN_SIZE, min(MAX_SIZE, max(self.resize_start_size + delta.x(),
+                                                           self.resize_start_size + delta.y())))
+                self.view_size = float(new_size)
                 self.resize(new_size, new_size)
             else:
+                # 拖动中只移动窗口，不实时吸附；松手时才判定，避免过程中闪动
                 self.move(event.globalPosition().toPoint() - self.drag_pos)
             event.accept()
 
     def mouseReleaseEvent(self, event):
+        # 只处理左键释放：右键松开用于弹菜单，中键等也不应改动拖拽/吸附状态。
+        if event.button() != Qt.MouseButton.LeftButton:
+            event.accept()
+            return
+        self.dragging = False
         if self.resizing:
             self.resizing = False
             self.size_px = self.width()
+            self.view_size = float(self.size_px)
             self.settings.setValue("size_px", self.size_px)
+        elif self.drag_move:
+            # 松手统一判定（中间→边缘：松手才缩成小表；吸附态拖离：松手恢复）
+            edge = self._edge_near(DOCK_SNAP)
+            if edge:
+                if not self.docked:
+                    self._enter_dock(edge)
+                else:
+                    # 吸附态拖动改了窗口位置：换边时先把固定几何摆正，再缩放绘制
+                    self.dock_edge = edge
+                    self.view_size = float(getattr(self, "dock_size", self.size_px))
+                    self.setGeometry(self._dock_target_geom(self.dock_size))
+                    self._animate_view(DOCK_SIZE, after=self._after_dock_shrink)
+                self.dock_hover = False
+            elif self.docked:
+                self._exit_dock()
         event.accept()
 
     def mouseDoubleClickEvent(self, event):
         self.toggle_topmost()
 
+    def wheelEvent(self, event):
+        """Ctrl + 鼠标滚轮：自由调整尺寸（上滚放大 / 下滚缩小）。
+        按 120 度为一格累积，兼容普通滚轮与触控板高精度滚动。
+
+        吸附态（小表 / 悬停放大）下忽略：此时窗口几何是固定的放大态矩形，
+        改尺寸会破坏吸附架构；需先拖离边缘松手退出吸附，恢复成固定窗口后
+        才能用滚轮调整。"""
+        if self.docked:
+            event.ignore()
+            return
+        if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            event.ignore()
+            return
+        event.accept()
+        self._wheel_acc += event.angleDelta().y()
+        steps = self._wheel_acc // 120
+        if steps == 0:
+            return
+        self._wheel_acc -= steps * 120
+        self._apply_size(self.width() + int(steps) * WHEEL_STEP)
+
     def closeEvent(self, event):
-        self.settings.setValue("pos", self.pos())
+        self._save_pos()
         super().closeEvent(event)
 
     def showEvent(self, event):
         super().showEvent(event)
+        # 窗口重新显示：恢复绘制与悬停轮询（隐藏期间已暂停，避免后台空耗）
+        if getattr(self, "timer", None) is not None and not self.timer.isActive():
+            self.timer.start(DRAW_INTERVAL_MS)
+        if getattr(self, "hover_timer", None) is not None and not self.hover_timer.isActive():
+            self.hover_timer.start(HOVER_INTERVAL_MS)
         if getattr(self, "tray", None) is not None:
             self._update_tray_tip()
             if self._menu is not None:
@@ -526,6 +1401,12 @@ class AstroClock(QWidget):
 
     def hideEvent(self, event):
         super().hideEvent(event)
+        # 窗口隐藏：停掉主绘制与悬停轮询，不再空耗 CPU；
+        # 托盘定时器保留，图标指针与提示仍按分钟更新。
+        if getattr(self, "timer", None) is not None:
+            self.timer.stop()
+        if getattr(self, "hover_timer", None) is not None:
+            self.hover_timer.stop()
         if getattr(self, "tray", None) is not None:
             self._update_tray_tip()
             if self._menu is not None:
@@ -550,8 +1431,21 @@ class AstroClock(QWidget):
         style_menu.triggered.connect(lambda a: self.set_theme(a.data()))
         self._menu_acts["styles"] = (acts, style_menu)
 
+        self._menu_acts["bg"] = menu.addAction("自定义背景图片…")
+        self._menu_acts["bg_focus"] = menu.addAction("调整背景焦点…")
+        self._menu_acts["bg_clear"] = menu.addAction("恢复默认背景")
+        menu.addSeparator()
+
         size_menu = menu.addMenu("尺寸")
         size_menu.setFont(self.font_cn)
+        # 提示项（禁用，仅说明操作）：拆成两行，当前尺寸另起一行显示
+        hint1 = size_menu.addAction("Ctrl + 滚轮自由调整")
+        hint1.setEnabled(False)
+        hint2 = size_menu.addAction("")
+        hint2.setEnabled(False)
+        self._menu_acts["size_hint1"] = hint1
+        self._menu_acts["size_hint"] = hint2
+        size_menu.addSeparator()
         sacts = []
         for sz in SIZES:
             act = size_menu.addAction("%d × %d" % (sz, sz))
@@ -563,6 +1457,8 @@ class AstroClock(QWidget):
         menu.addSeparator()
         self._menu_acts["top"] = menu.addAction("窗口置顶")
         self._menu_acts["top"].setCheckable(True)
+        self._menu_acts["auto"] = menu.addAction("开机自启动")
+        self._menu_acts["auto"].setCheckable(True)
         self._menu_acts["vis"] = menu.addAction("隐藏窗口")
         self._menu_acts["loc"] = menu.addAction("设置经纬度…")
         self._menu_acts["about"] = menu.addAction("关于")
@@ -572,12 +1468,38 @@ class AstroClock(QWidget):
         menu.triggered.connect(self._on_menu_action)
         # 托盘原生弹出菜单时不会走 contextMenuEvent，故用 aboutToShow 统一刷新
         menu.aboutToShow.connect(self._refresh_menu)
+        # 菜单打开期间暂停吸附悬停判定：放大后右键开菜单时，鼠标移到菜单上
+        # 会被轮询误判为「离开表盘」而缩回。表盘 exec() 与托盘原生弹出都会发这两个信号。
+        menu.aboutToShow.connect(self._menu_opened)
+        menu.aboutToHide.connect(self._menu_closed)
         return menu
+
+    def _menu_opened(self):
+        self._menu_depth += 1
+        # 放大态开菜单：冻结当前视口尺寸，菜单期间绝不允许缩回。
+        # 仅当确实处于放大态（绘制边长明显大于小表）时才置位，避免小表态托盘菜单误判。
+        if self.docked and getattr(self, "view_size", 0) > DOCK_SIZE + 4:
+            self.dock_hover = True
+
+    def _menu_closed(self):
+        self._menu_depth = max(0, self._menu_depth - 1)
+        if self._menu_depth == 0:
+            # 关闭后给 0.6s 宽限：鼠标可能停在菜单原位置（表盘外），
+            # 若立即恢复轮询会误判离开而缩回；宽限期内不缩回。
+            self._menu_hold_until = datetime.now().timestamp() + 0.6
 
     def _on_menu_action(self, act):
         """菜单动作统一入口（表盘右键 / 托盘右键 共用）。"""
-        if act is self._menu_acts.get("top"):
+        if act is self._menu_acts.get("bg"):
+            self.choose_background_image()
+        elif act is self._menu_acts.get("bg_focus"):
+            self.adjust_background_focus()
+        elif act is self._menu_acts.get("bg_clear"):
+            self.clear_background_image()
+        elif act is self._menu_acts.get("top"):
             self.toggle_topmost()
+        elif act is self._menu_acts.get("auto"):
+            self.toggle_autostart()
         elif act is self._menu_acts.get("vis"):
             self.toggle_visible()
         elif act is self._menu_acts.get("loc"):
@@ -596,13 +1518,40 @@ class AstroClock(QWidget):
         style_acts = acts_styles[0]
         for act, key in zip(style_acts, THEMES):
             act.setText(THEME_NAMES[key] + ("  ✓" if key == self.theme else ""))
+        bg_clear = self._menu_acts.get("bg_clear")
+        if bg_clear is not None:
+            bg_clear.setEnabled(self.bg_pixmap is not None)
+        bg_focus = self._menu_acts.get("bg_focus")
+        if bg_focus is not None:
+            bg_focus.setEnabled(self.bg_pixmap is not None)
         for act, sz in zip(self._menu_acts["sizes"][0], SIZES):
             act.setText("%d × %d" % (sz, sz) + ("  ✓" if sz == self.size_px else ""))
+        # 提示项：吸附态给出「放大后才能调整」的明确指引，正常态显示快捷操作
+        hint1 = self._menu_acts.get("size_hint1")
+        if hint1 is not None:
+            hint1.setText("先放大时钟，再调整尺寸" if self.docked else "Ctrl + 滚轮自由调整")
+        hint = self._menu_acts.get("size_hint")
+        if hint is not None:
+            hint.setText("当前 %d × %d" % (self.size_px, self.size_px))
+        # 吸附态只置灰档位项、不禁用子菜单本身：子菜单仍可展开，
+        # 用户能看到上面的提示，知道要先拖离边缘放大后再调整。
+        for act in self._menu_acts["sizes"][0]:
+            act.setEnabled(not self.docked)
         self._menu_acts["top"].setChecked(self.topmost)
+        # 以注册表真实状态为准（含任务管理器禁用标记），不读 QSettings 布尔值
+        self._menu_acts["auto"].setChecked(get_autostart_status()[0])
         self._menu_acts["vis"].setText("隐藏窗口" if self.isVisible() else "显示窗口")
 
     def contextMenuEvent(self, event):
-        """表盘右键：与托盘右键同一套菜单。"""
+        """表盘右键：与托盘右键同一套菜单。
+
+        吸附态（小表 / 悬停放大，即尚未拖离边缘固定下来）下不弹出：
+        放大态开菜单会让鼠标离开表盘触发缩回，且此时也不应改设置/尺寸。
+        需先拖离边缘松手退出吸附、恢复成固定窗口后，才能右键打开菜单。
+        托盘右键不受影响，隐藏窗口后仍可通过托盘操作。"""
+        if self.docked:
+            event.ignore()
+            return
         if self._menu is None:
             self._menu = self._build_menu()
         self._refresh_menu()
@@ -610,7 +1559,7 @@ class AstroClock(QWidget):
 
     def _quit(self):
         """退出：先撤掉托盘图标，否则残留图标会留在通知区直到鼠标划过。"""
-        self.settings.setValue("pos", self.pos())
+        self._save_pos()
         self.tray.setVisible(False)
         QApplication.quit()
 
@@ -622,7 +1571,8 @@ class AstroClock(QWidget):
         warm.fill(QColor(0, 0, 0, 0))
         wp = QPainter(warm)
         wp.setFont(self.font_cn)
-        strings = ["表盘样式", "尺寸", "窗口置顶", "隐藏窗口", "设置经纬度…", "关于", "退出"] + \
+        strings = ["表盘样式", "自定义背景图片…", "调整背景焦点…", "恢复默认背景", "尺寸", "Ctrl + 滚轮自由调整",
+                   "当前 400 × 400", "窗口置顶", "开机自启动", "隐藏窗口", "设置经纬度…", "关于", "退出"] + \
                   list(THEME_NAMES.values()) + \
                   ["%d × %d" % (s, s) for s in SIZES]
         for s in strings:
@@ -674,11 +1624,13 @@ class AstroClock(QWidget):
             QMessageBox.information(
                 self, "关于",
                 "桌面天文机械表\n\n"
-                "六种样式：经典天文钟 / 赛博朋克霓虹 / 极简现代 / 中式古风 / 高仿真机械表 / 天文机械腕表\n"
+                "六种内置样式：经典天文钟 / 赛博朋克霓虹 / 极简现代 / 中式古风 / 高仿真机械表 / 天文机械腕表\n"
+                "另支持自定义背景图片表盘\n"
                 "当前样式：%s\n"
                 "天文算法：Meeus 简化算法，离线计算\n"
                 "当前位置：北纬 %.2f° 东经 %.2f°\n\n"
-                "拖动移动 · 右下角拖拽缩放 · 双击切置顶 · 右键菜单"
+                "拖动移动 · 右下角拖拽 / Ctrl+滚轮缩放 · 双击切置顶 · 右键菜单\n"
+                "拖到屏幕上/左/右边自动缩成小表，鼠标移上去放大、移开缩回，拖离边缘松手还原"
                 % (THEME_NAMES[self.theme], self.lat, self.lon),
             )
         finally:
@@ -686,6 +1638,10 @@ class AstroClock(QWidget):
 
     def set_theme(self, key):
         if key in THEMES:
+            if key == "custom" and self.bg_pixmap is None:
+                # 菜单里直接选「自定义背景图片」时，先引导选图；取消则保持原样式
+                if not self.choose_background_image():
+                    return
             self.theme = key
             self.settings.setValue("theme", key)
             if getattr(self, "tray", None) is not None:
@@ -696,14 +1652,30 @@ class AstroClock(QWidget):
             self.update()
 
     def set_size(self, sz):
-        if sz in SIZES:
-            self.size_px = sz
-            pos = self.pos()
-            self.resize(sz, sz)
-            self.settings.setValue("size_px", sz)
-            self.move(pos)
-            if self._menu is not None:
-                self._refresh_menu()
+        """菜单快捷档位入口。"""
+        if sz is None:  # 说明项（data 为空）被误触发时忽略
+            return
+        # 吸附态（小表 / 悬停放大）下窗口几何固定，不允许从托盘/表盘菜单改尺寸；
+        # 需先拖离边缘松手退出吸附再调整
+        if self.docked:
+            return
+        self._apply_size(sz)
+
+    def _apply_size(self, sz):
+        """应用任意尺寸（档位 / Ctrl+滚轮 / 拖拽统一走这里），钳制到允许范围，
+        保持窗口左上角不动，并即时持久化 + 刷新菜单勾选。"""
+        sz = max(MIN_SIZE, min(MAX_SIZE, int(sz)))
+        self._stop_dock_anim()  # 手动改尺寸时中止吸附过渡
+        pos = self.pos()
+        self.size_px = sz
+        self._wheel_acc = 0
+        if not getattr(self, "docked", False):
+            self.view_size = float(sz)  # 非吸附态绘制边长跟随窗口尺寸
+        self.resize(sz, sz)
+        self.settings.setValue("size_px", sz)
+        self.move(pos)
+        if self._menu is not None:
+            self._refresh_menu()
 
     def toggle_topmost(self):
         self.topmost = not self.topmost
@@ -714,6 +1686,21 @@ class AstroClock(QWidget):
         self.settings.setValue("topmost", self.topmost)
         if getattr(self, "tray", None) is not None:
             self._update_tray_tip()
+        if self._menu is not None:
+            self._refresh_menu()
+
+    def toggle_autostart(self):
+        """开关开机自启动。状态以注册表为准，操作后立即刷新菜单勾选。"""
+        enable = not get_autostart_status()[0]
+        ok, msg = set_autostart(enable)
+        if ok:
+            self.settings.setValue("autostart", enable)
+        else:
+            was = self._suspend_topmost()
+            try:
+                QMessageBox.warning(self, "开机自启动", "设置失败：\n%s" % msg)
+            finally:
+                self._restore_topmost(was)
         if self._menu is not None:
             self._refresh_menu()
 
@@ -739,15 +1726,21 @@ class AstroClock(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
-        s = self.width() / BASE
+        # 绘制视口：吸附动画只改 view_size（绘制边长），窗口物理几何全程不动，
+        # 因此 DWM 不会逐帧重排窗口（不抖），位置也不依赖读回的 frameGeometry（不漂移）。
+        view = getattr(self, "view_size", None) or self.width()
+        vx, vy = self._view_origin(view)
+        p.translate(vx, vy)
+        s = view / BASE
         p.scale(s, s)
 
-        # 天文数据每秒算一次即可（太阳/月亮/恒星时在一秒内变化极小）；
-        # local 时间每帧更新，保证扫动秒针顺滑。避免每帧重算降低交互响应。
+        # 天文数据每分钟算一次即可（太阳黄经/月相/恒星时在一分钟内变化极小，
+        # 换算到表盘像素上远小于 1px）；这样每秒交界处那一下重算也省掉。
+        # local 时间每帧更新，保证扫动秒针依旧顺滑。
         now = datetime.now()
-        sec_key = int(now.timestamp())
-        if self._ctx is None or sec_key != self._ctx_sec:
-            self._ctx_sec = sec_key
+        min_key = int(now.timestamp()) // 60
+        if self._ctx is None or min_key != self._ctx_min:
+            self._ctx_min = min_key
             now_utc = datetime.now(timezone.utc)
             jd = julian_day(now_utc)
             sun_lon = sun_apparent_longitude(jd)
@@ -781,6 +1774,7 @@ class AstroClock(QWidget):
             "chinese": self.paint_chinese,
             "mechanical": self.paint_mechanical,
             "astro": self.paint_astro,
+            "custom": self.paint_custom,
         }
         painter_for[self.theme](p, ctx)
         self.draw_resize_handle(p)
@@ -792,6 +1786,116 @@ class AstroClock(QWidget):
         for i in range(3):
             off = i * 4
             p.drawLine(QLineF(x - off, y + 6, x + 6, y - off))
+
+    # ================= 样式 7：自定义背景图片 =================
+    def paint_custom(self, p, ctx):
+        """自定义图片铺底 + 秒针/天文信息叠加；图片只解码一次并缓存。"""
+        cx = cy = 200.0
+        pm = getattr(self, "bg_pixmap", None)
+        if pm is None:
+            self.paint_classic(p, ctx)
+            return
+
+        # 圆形裁剪铺底（cover 模式，副本已按正方形裁好）
+        clip = QPainterPath()
+        clip.addEllipse(QRectF(cx - 196, cy - 196, 392, 392))
+        p.save()
+        p.setClipPath(clip)
+        p.drawPixmap(QRectF(cx - 196, cy - 196, 392, 392), pm,
+                     QRectF(0, 0, pm.width(), pm.height()))
+        # 暗角让浅色图片也能衬托刻度与指针
+        vignette = QRadialGradient(cx, cy, 30, cx, cy, 196)
+        vignette.setColorAt(0.0, QColor(0, 0, 0, 0))
+        vignette.setColorAt(0.72, QColor(0, 0, 0, 18))
+        vignette.setColorAt(1.0, QColor(0, 0, 0, 105))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(vignette))
+        p.drawEllipse(QRectF(cx - 196, cy - 196, 392, 392))
+        p.restore()
+
+        # 外框与刻度：明暗双描边，保证任何底色下都清楚
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(0, 0, 0, 150), 4))
+        p.drawEllipse(QRectF(cx - 194, cy - 194, 388, 388))
+        p.setPen(QPen(QColor(245, 228, 196), 2.2))
+        p.drawEllipse(QRectF(cx - 194, cy - 194, 388, 388))
+        p.setPen(QPen(QColor(255, 255, 255, 90), 0.8))
+        p.drawEllipse(QRectF(cx - 182, cy - 182, 364, 364))
+        p.drawEllipse(QRectF(cx - 148, cy - 148, 296, 296))
+
+        for i in range(60):
+            a = math.radians(i * 6 - 90)
+            major = (i % 5 == 0)
+            r1 = 164 if major else 174
+            r2 = 184
+            x1, y1 = cx + r1 * math.cos(a), cy + r1 * math.sin(a)
+            x2, y2 = cx + r2 * math.cos(a), cy + r2 * math.sin(a)
+            p.setPen(QPen(QColor(0, 0, 0, 170), 3.2 if major else 1.8))
+            p.drawLine(QLineF(x1 + 0.8, y1 + 0.8, x2 + 0.8, y2 + 0.8))
+            p.setPen(QPen(QColor(245, 228, 196) if major else QColor(255, 255, 255, 190),
+                          1.8 if major else 0.8))
+            p.drawLine(QLineF(x1, y1, x2, y2))
+
+        # 时标数字
+        p.setFont(self.font_num)
+        for h in range(1, 13):
+            a = math.radians(h * 30 - 90)
+            x, y = cx + 143 * math.cos(a), cy + 143 * math.sin(a)
+            rect = QRectF(x - 12, y - 10, 24, 20)
+            p.setPen(QPen(QColor(0, 0, 0, 190)))
+            p.drawText(rect.translated(0.8, 0.8), int(Qt.AlignmentFlag.AlignCenter), str(h))
+            p.setPen(QPen(WHITE))
+            p.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), str(h))
+
+        # 天文信息：节气 / 星座 / 日出日落 / 恒星时
+        local = ctx["local"]
+        p.setFont(self.font_cn)
+        p.setPen(QPen(QColor(0, 0, 0, 200)))
+        p.drawText(QRectF(cx - 105, cy - 103, 210, 20), int(Qt.AlignmentFlag.AlignCenter),
+                   "节气 %s · %s座" % (ctx["term"], ZODIACS[ctx["zodiac_idx"]]))
+        p.setPen(QPen(WHITE))
+        p.drawText(QRectF(cx - 105, cy - 104, 210, 20), int(Qt.AlignmentFlag.AlignCenter),
+                   "节气 %s · %s座" % (ctx["term"], ZODIACS[ctx["zodiac_idx"]]))
+        p.setFont(self.font_small)
+        p.setPen(QPen(QColor(0, 0, 0, 190)))
+        p.drawText(QRectF(cx - 105, cy + 108, 210, 16), int(Qt.AlignmentFlag.AlignCenter),
+                   "日出 %.1f  日落 %.1f  恒星时 %.1f°"
+                   % (ctx["sunrise"], ctx["sunset"], ctx["lst"]))
+        p.setPen(QPen(QColor(255, 255, 255, 230)))
+        p.drawText(QRectF(cx - 105, cy + 107, 210, 16), int(Qt.AlignmentFlag.AlignCenter),
+                   "日出 %.1f  日落 %.1f  恒星时 %.1f°"
+                   % (ctx["sunrise"], ctx["sunset"], ctx["lst"]))
+
+        # 带描边的指针：任意底色都清晰
+        sec = local.second + local.microsecond / 1e6
+        minute = local.minute + sec / 60.0
+        hour = (local.hour % 12) + minute / 60.0
+        for ang, length, color, width, back in [
+            (hour * 30, 86, QColor(255, 238, 205), 4.2, 14),
+            (minute * 6, 118, QColor(255, 255, 255), 3.0, 16),
+            (sec * 6, 132, QColor(255, 92, 92), 1.8, 20),
+        ]:
+            a = math.radians(ang - 90)
+            line = QLineF(cx - back * math.cos(a), cy - back * math.sin(a),
+                          cx + length * math.cos(a), cy + length * math.sin(a))
+            p.setPen(QPen(QColor(0, 0, 0, 190), width + 2.2))
+            p.drawLine(line)
+            pen = QPen(color, width)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(pen)
+            p.drawLine(line)
+        p.setPen(QPen(QColor(0, 0, 0, 170), 1))
+        p.setBrush(QBrush(QColor(245, 228, 196)))
+        p.drawEllipse(QRectF(cx - 5, cy - 5, 10, 10))
+
+        # 日期放最下方，避开中心指针
+        p.setFont(self.font_small)
+        p.setPen(QPen(QColor(0, 0, 0, 180)))
+        p.drawText(QRectF(cx - 70, cy + 126, 140, 16), int(Qt.AlignmentFlag.AlignCenter),
+                   local.strftime("%Y.%m.%d"))
+        p.setPen(QPen(QColor(255, 255, 255, 220)))
+        p.drawText(QRectF(cx - 70, cy + 125, 140, 16), int(Qt.AlignmentFlag.AlignCenter),
+                   local.strftime("%Y.%m.%d"))
 
     # ================= 样式 1：经典天文钟 =================
     def paint_classic(self, p, ctx):
